@@ -42,6 +42,8 @@
 #define MAX_NR_GPIO 300
 #define PS_HOLD_OFFSET 0x820
 
+bool need_show_pinctrl_irq;
+bool fp_irq_cnt;
 /**
  * struct msm_pinctrl - state for a pinctrl-msm device
  * @dev:            device handle.
@@ -799,6 +801,7 @@ static void msm_gpio_irq_handler(struct irq_desc *desc)
 				need_show_pinctrl_irq = false;
 #ifdef VENDOR_EDIT
 				if (strstr(irq_to_desc(irq_pin)->action->name, "soc:fpc_fpc1020") != NULL) { //it is fpc irq
+					fp_irq_cnt = true;
 					c0_cpufreq_limit_queue();
 				}
 #endif
