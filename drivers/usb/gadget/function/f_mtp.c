@@ -39,15 +39,37 @@
 #include <linux/usb/f_mtp.h>
 #include <linux/configfs.h>
 #include <linux/usb/composite.h>
-#ifdef VENDOR_EDIT
 #include <linux/pm_qos.h>
-#endif
 
 #include "configfs.h"
 
 #define MTP_RX_BUFFER_INIT_SIZE    1048576
 #define MTP_TX_BUFFER_INIT_SIZE    1048576
 #define MTP_BULK_BUFFER_SIZE       16384
+// Currently tx and rx buffer len is 1048576, inter buffer len is 28.
+// Tx buffer counts is 8, Rx is 2 and intr is 5.
+// In order avoid MTP can't work issue, use fixed memory.
+// 0xAC400000(0xffffffc02c400000) ------
+//                               |  TX  | 0x100000 * 8
+// 0xACC00000(0xffffffc02cc00000) ------
+//                               |  RX  | 0x100000 * 2
+// 0xACE00000(0xffffffc02ce00000) ------
+//                               | INTR | 0x40(alignment) * 5
+//                                ------
+//Anderson@, 2016/12/09, Add fix memory for MTP
+//0xAC400000, 0xAC500000, 0xAC600000, 0xAC700000, 0xAC800000, 0xAC900000, 0xACA00000, 0xACB00000
+#define MTP_TX_BUFFER_BASE           0xAC400000
+//0xACC00000, 0xACD00000
+#define MTP_RX_BUFFER_BASE           0xACC00000
+//0xACE00000, 0xACE00040, 0xACE00080, 0xACE000C0, 0xACE00100
+#define MTP_INTR_BUFFER_BASE         0xACE00000
+static int mtpBufferOffset =0;
+static bool useFixAddr = false;
+enum buf_type {
+	TX_BUFFER = 0,
+	RX_BUFFER,
+	INTR_BUFFER,
+};
 #define INTR_BUFFER_SIZE           28
 #define MAX_INST_NAME_LEN          40
 
@@ -81,11 +103,9 @@
 #define DRIVER_NAME "mtp"
 
 #define MAX_ITERATION		100
-#ifdef VENDOR_EDIT
 #define PM_QOS_TIMEOUT	3000000
 
 static bool mtp_receive_flag;
-#endif
 
 unsigned int mtp_rx_req_len = MTP_RX_BUFFER_INIT_SIZE;
 module_param(mtp_rx_req_len, uint, S_IRUGO | S_IWUSR);
@@ -97,11 +117,9 @@ unsigned int mtp_tx_reqs = MTP_TX_REQ_MAX;
 module_param(mtp_tx_reqs, uint, S_IRUGO | S_IWUSR);
 
 static const char mtp_shortname[] = DRIVER_NAME "_usb";
-#ifdef VENDOR_EDIT
 static struct pm_qos_request little_cpu_mtp_freq;
 static struct pm_qos_request devfreq_mtp_request;
 //static struct pm_qos_request big_cpu_mtp_freq;
-#endif
 
 struct mtp_dev {
 	struct usb_function function;
@@ -422,18 +440,42 @@ static inline struct mtp_dev *func_to_mtp(struct usb_function *f)
 {
 	return container_of(f, struct mtp_dev, function);
 }
-
-static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
+//Anderson@, 2016/12/09, Add fix memory for MTP
+static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size, enum buf_type type)
 {
 	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
 	if (!req)
 		return NULL;
 
 	/* now allocate buffers for the requests */
-	req->buf = kmalloc(buffer_size, GFP_KERNEL);
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	if(useFixAddr == true) {
+		if(type == TX_BUFFER){
+			req->buf = __va(MTP_TX_BUFFER_BASE + mtpBufferOffset);
+		}
+		else if(type == RX_BUFFER){
+			req->buf = __va(MTP_RX_BUFFER_BASE + mtpBufferOffset);
+		}
+		else{
+			req->buf = __va(MTP_INTR_BUFFER_BASE + mtpBufferOffset);
+		}
+	}
+	else{
+		req->buf = kmalloc(buffer_size, GFP_KERNEL);
+	}
+	memset(req->buf, 0, buffer_size);
+
 	if (!req->buf) {
 		usb_ep_free_request(ep, req);
 		return NULL;
+	}
+
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	if(useFixAddr == true) {
+		if(buffer_size == INTR_BUFFER_SIZE)
+			mtpBufferOffset += 0x40; /*alignment*/
+		else
+			mtpBufferOffset += buffer_size;
 	}
 
 	return req;
@@ -442,7 +484,14 @@ static struct usb_request *mtp_request_new(struct usb_ep *ep, int buffer_size)
 static void mtp_request_free(struct usb_request *req, struct usb_ep *ep)
 {
 	if (req) {
-		kfree(req->buf);
+		//Anderson@, 2016/12/09, Add fix memory for MTP
+		if(useFixAddr == true) {
+			req->buf = NULL;
+			mtpBufferOffset = 0;
+		}
+		else
+			kfree(req->buf);
+
 		usb_ep_free_request(ep, req);
 	}
 }
@@ -566,9 +615,17 @@ static int mtp_create_bulk_endpoints(struct mtp_dev *dev,
 	dev->ep_intr = ep;
 
 retry_tx_alloc:
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	if(mtp_tx_req_len == MTP_TX_BUFFER_INIT_SIZE && mtp_rx_req_len == MTP_RX_BUFFER_INIT_SIZE && mtp_tx_reqs == MTP_TX_REQ_MAX)
+		useFixAddr = true;
+	else
+		useFixAddr = false;
+	pr_info("useFixAddr:%s\n", useFixAddr?"true":"false");
+	mtpBufferOffset =0;
 	/* now allocate requests for our endpoints */
 	for (i = 0; i < mtp_tx_reqs; i++) {
-		req = mtp_request_new(dev->ep_in, mtp_tx_req_len);
+		//Anderson@, 2016/12/09, Add fix memory for MTP
+		req = mtp_request_new(dev->ep_in, mtp_tx_req_len, TX_BUFFER);
 		if (!req) {
 			if (mtp_tx_req_len <= MTP_BULK_BUFFER_SIZE)
 				goto fail;
@@ -592,8 +649,11 @@ retry_tx_alloc:
 		mtp_rx_req_len = MTP_BULK_BUFFER_SIZE;
 
 retry_rx_alloc:
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	mtpBufferOffset =0;
 	for (i = 0; i < RX_REQ_MAX; i++) {
-		req = mtp_request_new(dev->ep_out, mtp_rx_req_len);
+		//Anderson@, 2016/12/09, Add fix memory for MTP
+		req = mtp_request_new(dev->ep_out, mtp_rx_req_len, RX_BUFFER);
 		if (!req) {
 			if (mtp_rx_req_len <= MTP_BULK_BUFFER_SIZE)
 				goto fail;
@@ -605,13 +665,18 @@ retry_rx_alloc:
 		req->complete = mtp_complete_out;
 		dev->rx_req[i] = req;
 	}
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	mtpBufferOffset =0;
 	for (i = 0; i < INTR_REQ_MAX; i++) {
-		req = mtp_request_new(dev->ep_intr, INTR_BUFFER_SIZE);
+		//Anderson@, 2016/12/09, Add fix memory for MTP
+		req = mtp_request_new(dev->ep_intr, INTR_BUFFER_SIZE, INTR_BUFFER);
 		if (!req)
 			goto fail;
 		req->complete = mtp_complete_intr;
 		mtp_req_put(dev, &dev->intr_idle, req);
 	}
+	//Anderson@, 2016/12/09, Add fix memory for MTP
+	mtpBufferOffset =0;
 
 	return 0;
 
@@ -1169,19 +1234,16 @@ static long mtp_send_receive_ioctl(struct file *fp, unsigned code,
 		dev->xfer_send_header = 0;
 	} else {
 		work = &dev->receive_file_work;
-#ifdef VENDOR_EDIT
 		pm_qos_update_request(&devfreq_mtp_request, MAX_CPUFREQ);
 		pm_qos_update_request(&little_cpu_mtp_freq, MAX_CPUFREQ);
 		msm_cpuidle_set_sleep_disable(true);
 		mtp_receive_flag = true;
-#endif
 	}
 
 	/* We do the file transfer on a work queue so it will run
 	 * in kernel context, which is necessary for vfs_read and
 	 * vfs_write to use our buffers in the kernel address space.
 	 */
-#ifdef VENDOR_EDIT
 	queue_work(dev->wq, work);
 	/* wait for operation to complete */
 	flush_workqueue(dev->wq);
@@ -1193,11 +1255,6 @@ static long mtp_send_receive_ioctl(struct file *fp, unsigned code,
 					MAX_CPUFREQ, PM_QOS_TIMEOUT);
 		msm_cpuidle_set_sleep_disable(false);
 	}
-#else
-	queue_work(dev->wq, work);
-	/* wait for operation to complete */
-	flush_workqueue(dev->wq);
-#endif
 	fput(filp);
 
 	/* read the result */
@@ -1344,12 +1401,10 @@ static int mtp_release(struct inode *ip, struct file *fp)
 {
 	printk(KERN_INFO "mtp_release\n");
 
-#ifdef VENDOR_EDIT
 	if (mtp_receive_flag) {
 		mtp_receive_flag = false;
 		msm_cpuidle_set_sleep_disable(false);
 	}
-#endif
 	mtp_unlock(&_mtp_dev->open_excl);
 	return 0;
 }
@@ -1548,7 +1603,6 @@ mtp_function_bind(struct usb_configuration *c, struct usb_function *f)
 			mtp_fullspeed_out_desc.bEndpointAddress;
 	}
 
-	fi_mtp->func_inst.f = &dev->function;
 	DBG(cdev, "%s speed %s: IN/%s, OUT/%s\n",
 		gadget_is_superspeed(c->cdev->gadget) ? "super" :
 		(gadget_is_dualspeed(c->cdev->gadget) ? "dual" : "full"),
@@ -1560,10 +1614,9 @@ static void
 mtp_function_unbind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct mtp_dev	*dev = func_to_mtp(f);
-	struct mtp_instance *fi_mtp;
 	struct usb_request *req;
 	int i;
-	fi_mtp = container_of(f->fi, struct mtp_instance, func_inst);
+
 	mtp_string_defs[INTERFACE_STRING_INDEX].id = 0;
 	mutex_lock(&dev->read_mutex);
 	while ((req = mtp_req_get(dev, &dev->tx_idle)))
@@ -1577,7 +1630,6 @@ mtp_function_unbind(struct usb_configuration *c, struct usb_function *f)
 	dev->is_ptp = false;
 	kfree(f->os_desc_table);
 	f->os_desc_n = 0;
-	fi_mtp->func_inst.f = NULL;
 }
 
 static int mtp_function_set_alt(struct usb_function *f,
@@ -1785,11 +1837,9 @@ static int __mtp_setup(struct mtp_instance *fi_mtp)
 	INIT_WORK(&dev->send_file_work, send_file_work);
 	INIT_WORK(&dev->receive_file_work, receive_file_work);
 
-#ifdef VENDOR_EDIT
 	pm_qos_add_request(&little_cpu_mtp_freq, PM_QOS_C0_CPUFREQ_MIN, MIN_CPUFREQ);
 	pm_qos_add_request(&devfreq_mtp_request, PM_QOS_DEVFREQ_MIN, MIN_CPUFREQ);
 	//pm_qos_add_request(&big_cpu_mtp_freq, PM_QOS_C1_CPUFREQ_MIN, MIN_CPUFREQ);
-#endif
 	_mtp_dev = dev;
 
 	ret = misc_register(&mtp_device);
@@ -1800,11 +1850,9 @@ static int __mtp_setup(struct mtp_instance *fi_mtp)
 	return 0;
 
 err2:
-#ifdef VENDOR_EDIT
 	//pm_qos_remove_request(&big_cpu_mtp_freq);
 	pm_qos_remove_request(&little_cpu_mtp_freq);
 	pm_qos_remove_request(&devfreq_mtp_request);
-#endif
 	destroy_workqueue(dev->wq);
 err1:
 	_mtp_dev = NULL;
@@ -1827,11 +1875,9 @@ static void mtp_cleanup(void)
 		return;
 
 	mtp_debugfs_remove();
-#ifdef VENDOR_EDIT
 	//pm_qos_remove_request(&big_cpu_mtp_freq);
 	pm_qos_remove_request(&little_cpu_mtp_freq);
 	pm_qos_remove_request(&devfreq_mtp_request);
-#endif
 	misc_deregister(&mtp_device);
 	destroy_workqueue(dev->wq);
 	_mtp_dev = NULL;
@@ -1929,8 +1975,6 @@ struct usb_function_instance *alloc_inst_mtp_ptp(bool mtp_config)
 	config_group_init_type_name(&fi_mtp->func_inst.group,
 					"", &mtp_func_type);
 
-	mutex_init(&fi_mtp->dev->read_mutex);
-
 	return  &fi_mtp->func_inst;
 }
 EXPORT_SYMBOL_GPL(alloc_inst_mtp_ptp);
@@ -1949,6 +1993,9 @@ static int mtp_ctrlreq_configfs(struct usb_function *f,
 static void mtp_free(struct usb_function *f)
 {
 	/*NO-OP: no function specific resource allocation in mtp_alloc*/
+	struct mtp_instance *fi_mtp;
+	fi_mtp = container_of(f->fi, struct mtp_instance, func_inst);
+	fi_mtp->func_inst.f = NULL;
 }
 
 struct usb_function *function_alloc_mtp_ptp(struct usb_function_instance *fi,
@@ -1991,7 +2038,9 @@ struct usb_function *function_alloc_mtp_ptp(struct usb_function_instance *fi,
 	dev->function.setup = mtp_ctrlreq_configfs;
 	dev->function.free_func = mtp_free;
 	dev->is_ptp = !mtp_config;
+	fi->f = &dev->function;
 
+	mutex_init(&dev->read_mutex);
 	return &dev->function;
 }
 EXPORT_SYMBOL_GPL(function_alloc_mtp_ptp);

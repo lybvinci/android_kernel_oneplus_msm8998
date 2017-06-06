@@ -42,7 +42,6 @@
 #include <soc/qcom/event_timer.h>
 #include <soc/qcom/lpm-stats.h>
 #include <soc/qcom/jtag.h>
-#include <soc/qcom/minidump.h>
 #include <asm/cputype.h>
 #include <asm/arch_timer.h>
 #include <asm/cacheflush.h>
@@ -72,8 +71,6 @@ enum debug_event {
 	CLUSTER_ENTER,
 	CLUSTER_EXIT,
 	PRE_PC_CB,
-	CPU_HP_STARTING,
-	CPU_HP_DYING,
 };
 
 struct lpm_debug {
@@ -156,12 +153,10 @@ static bool sleep_disabled;
 module_param_named(sleep_disabled,
 	sleep_disabled, bool, S_IRUGO | S_IWUSR | S_IWGRP);
 
-#ifdef VENDOR_EDIT
 void msm_cpuidle_set_sleep_disable(bool disable)
 {
 	sleep_disabled = disable;
 }
-#endif
 
 s32 msm_cpuidle_get_deep_idle_latency(void)
 {
@@ -350,16 +345,10 @@ static int lpm_cpu_callback(struct notifier_block *cpu_nb,
 
 	switch (action & ~CPU_TASKS_FROZEN) {
 	case CPU_DYING:
-		update_debug_pc_event(CPU_HP_DYING, cpu,
-				cluster->num_children_in_sync.bits[0],
-				cluster->child_cpus.bits[0], false);
 		cluster_prepare(cluster, get_cpu_mask((unsigned int) cpu),
 					NR_LPM_LEVELS, false, 0);
 		break;
 	case CPU_STARTING:
-		update_debug_pc_event(CPU_HP_STARTING, cpu,
-				cluster->num_children_in_sync.bits[0],
-				cluster->child_cpus.bits[0], false);
 		cluster_unprepare(cluster, get_cpu_mask((unsigned int) cpu),
 					NR_LPM_LEVELS, false, 0);
 		break;
@@ -368,22 +357,6 @@ static int lpm_cpu_callback(struct notifier_block *cpu_nb,
 	}
 	return NOTIFY_OK;
 }
-
-#ifdef CONFIG_ARM_PSCI
-static int __init set_cpuidle_ops(void)
-{
-	int ret = 0, cpu;
-
-	for_each_possible_cpu(cpu) {
-		ret = arm_cpuidle_init(cpu);
-		if (ret)
-			goto exit;
-	}
-
-exit:
-	return ret;
-}
-#endif
 
 static enum hrtimer_restart lpm_hrtimer_cb(struct hrtimer *h)
 {
@@ -713,7 +686,7 @@ static int cpu_power_select(struct cpuidle_device *dev,
 	if (!cpu)
 		return -EINVAL;
 
-	if (sleep_disabled && !cpu_isolated(dev->cpu))
+	if (sleep_disabled)
 		return 0;
 
 	idx_restrict = cpu->nlevels + 1;
@@ -1123,14 +1096,10 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 		bool from_idle, int predicted)
 {
 	struct lpm_cluster_level *level = &cluster->levels[idx];
-	struct cpumask online_cpus;
 	int ret, i;
 
-	cpumask_and(&online_cpus, &cluster->num_children_in_sync,
-					cpu_online_mask);
-
 	if (!cpumask_equal(&cluster->num_children_in_sync, &cluster->child_cpus)
-			|| is_IPI_pending(&online_cpus)) {
+			|| is_IPI_pending(&cluster->num_children_in_sync)) {
 		return -EPERM;
 	}
 
@@ -1838,7 +1807,9 @@ static int lpm_suspend_enter(suspend_state_t state)
 	if (idx > 0)
 		update_debug_pc_event(CPU_ENTER, idx, 0xdeaffeed,
 					0xdeaffeed, false);
-
+#ifdef  CONFIG_PM_SUSPEND_DEBUG_OP
+	debug_print_suspend_stats();
+#else
 	/*
 	 * Print the clocks which are enabled during system suspend
 	 * This debug information is useful to know which are the
@@ -1846,6 +1817,7 @@ static int lpm_suspend_enter(suspend_state_t state)
 	 * LPMs(XO and Vmin).
 	 */
 	clock_debug_print_enabled();
+#endif
 
 	BUG_ON(!use_psci);
 	psci_enter_sleep(cluster, idx, true);
@@ -1871,7 +1843,6 @@ static int lpm_probe(struct platform_device *pdev)
 	int ret;
 	int size;
 	struct kobject *module_kobj = NULL;
-	struct md_region md_entry;
 
 	get_online_cpus();
 	lpm_root_node = lpm_of_parse_cluster(pdev);
@@ -1932,14 +1903,6 @@ static int lpm_probe(struct platform_device *pdev)
 		goto failed;
 	}
 
-	/* Add lpm_debug to Minidump*/
-	strlcpy(md_entry.name, "KLPMDEBUG", sizeof(md_entry.name));
-	md_entry.virt_addr = (uintptr_t)lpm_debug;
-	md_entry.phys_addr = lpm_debug_phys;
-	md_entry.size = size;
-	if (msm_minidump_add_region(&md_entry))
-		pr_info("Failed to add lpm_debug in Minidump\n");
-
 	return 0;
 failed:
 	free_cluster_node(lpm_root_node);
@@ -1969,14 +1932,6 @@ static int __init lpm_levels_module_init(void)
 		pr_info("Error registering %s\n", lpm_driver.driver.name);
 		goto fail;
 	}
-
-#ifdef CONFIG_ARM_PSCI
-	rc = set_cpuidle_ops();
-	if (rc) {
-		pr_err("%s(): Failed to set cpuidle ops\n", __func__);
-		goto fail;
-	}
-#endif
 
 fail:
 	return rc;
